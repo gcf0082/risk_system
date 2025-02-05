@@ -1,9 +1,9 @@
 import logging
 import uuid
+import sqlite3
+import json
 from enum import IntEnum
 from typing import Any, Callable, Dict, List, Optional, Union
-from collections import defaultdict
-import json
 from pathlib import Path
 
 # 配置日志模块
@@ -22,15 +22,10 @@ class EntityType(IntEnum):
 
     @classmethod
     def get(cls, type_str: str) -> Optional['EntityType']:
-        """安全获取枚举值"""
         try:
             return cls[type_str.upper()]
         except KeyError:
             return None  
-
-    @classmethod
-    def is_valid_type(cls, type_str: str) -> bool:
-        return type_str.upper() in cls._member_names_              
 
 class RiskLevel(IntEnum):
     """风险等级体系"""
@@ -44,418 +39,775 @@ class RiskLevel(IntEnum):
     def from_value(cls, value: int) -> 'RiskLevel':
         return cls(value) if value in cls._value2member_map_ else cls.NONE
 
-class Entity:
-    """实体对象"""
-    def __init__(
-        self,
-        name: str,
-        entity_type: EntityType,
-        metadata: Optional[Dict[str, Any]] = None
-    ):
-        self.entity_id = str(uuid.uuid4())
-        self.name = name
-        self.type = entity_type
-        self.metadata = metadata or {}
+class DatabaseManager:
+    """增强的数据库管理类"""
+    def __init__(self, db_path=':memory:'):
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.create_tables()
 
-    def __repr__(self) -> str:
-        return f"<{self.type.name} {self.name}>"
+    def create_tables(self):
+        """创建数据表结构"""
+        with self.conn:
+            self.conn.executescript('''
+                CREATE TABLE IF NOT EXISTS projects (
+                    project_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL
+                );
+                
+                CREATE TABLE IF NOT EXISTS entities (
+                    entity_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    type INTEGER NOT NULL,
+                    metadata TEXT,
+                    project_id TEXT NOT NULL,
+                    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+                );
+                
+                CREATE TABLE IF NOT EXISTS auto_risks (
+                    risk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_id TEXT NOT NULL,
+                    rule_name TEXT NOT NULL,
+                    level INTEGER NOT NULL,
+                    details TEXT NOT NULL,
+                    FOREIGN KEY(entity_id) REFERENCES entities(entity_id) ON DELETE CASCADE
+                );
+                
+                CREATE TABLE IF NOT EXISTS manual_risks (
+                    risk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_id TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    level INTEGER NOT NULL,
+                    evidence TEXT NOT NULL,
+                    FOREIGN KEY(entity_id) REFERENCES entities(entity_id) ON DELETE CASCADE
+                );
+            ''')
 
-class EntityRisk:
-    """实体风险评估"""
-    def __init__(self, entity: Entity):
-        self.entity = entity
-        self.auto_risks = []
-        self.manual_risks = []
+    # 项目操作
+    def project_exists(self, project_id: str) -> bool:
+        """检查项目是否存在"""
+        cursor = self.conn.execute(
+            'SELECT 1 FROM projects WHERE project_id = ?', 
+            (project_id,)
+        )
+        return bool(cursor.fetchone())
 
-    def add_auto_risk(self, rule_name: str, level: RiskLevel, details: dict):
-        self.auto_risks.append({
-            "type": "auto",
-            "rule": rule_name,
-            "level": level,
-            "details": details
-        })
-
-    def add_manual_risk(self, description: str, level: RiskLevel, evidence: str):
-        self.manual_risks.append({
-            "type": "manual",
-            "description": description,
-            "level": level,
-            "evidence": evidence
-        })
-
-    @property
-    def all_risks(self) -> List[dict]:
-        return self.auto_risks + self.manual_risks
-
-    @property
-    def max_risk_level(self) -> RiskLevel:
-        if not self.all_risks:
-            return RiskLevel.NONE
-        return max((r["level"] for r in self.all_risks), default=RiskLevel.NONE)
-
-    def get_detailed_report(self) -> dict:
-        return {
-            "entity_id": self.entity.entity_id,
-            "name": self.entity.name,
-            "type": self.entity.type.name,
-            "risk_level": self.max_risk_level.name,
-            "total_risks": len(self.all_risks),
-            "auto_risks": self.auto_risks,
-            "manual_risks": self.manual_risks
-        }
-
-class Project:
-    """项目管理"""
-    def __init__(self, project_id: str, name: str):
-        self.project_id = project_id
-        self.name = name
-        self.entities = {}  # {entity_id: Entity}
-        self.risks = {}     # {entity_id: EntityRisk}
-
-    def add_entity(self, entity: Entity) -> None:
-        self.entities[entity.entity_id] = entity
-
-    def update_risk(self, entity_id: str, risk: EntityRisk) -> None:
-        self.risks[entity_id] = risk
-
-    @property
-    def overall_risk(self) -> RiskLevel:
-        if not self.risks:
-            return RiskLevel.NONE
-        return max((r.max_risk_level for r in self.risks.values()), default=RiskLevel.NONE)
-
-    def get_full_report(self) -> dict:
-        return {
-            "project_info": {
-                "id": self.project_id,
-                "name": self.name,
-                "overall_risk": self.overall_risk.name
-            },
-            "entities": [r.get_detailed_report() for r in self.risks.values()]
-        }
-
-    def find_entities_by_name_type(
-        self, 
-        name: str, 
-        entity_type: EntityType
-    ) -> List[Entity]:
-        """根据名称和类型查找实体"""
-        return [
-            e for e in self.entities.values()
-            if e.name == name and e.type == entity_type
-        ]        
-
-class RiskRule:
-    """风险规则"""
-    def __init__(
-        self,
-        name: str,
-        condition: Callable[[Entity], bool],
-        description: str,
-        level: RiskLevel,
-        target_types: List[EntityType]
-    ):
-        self.name = name
-        self.condition = condition
-        self.description = description
-        self.level = level
-        self.target_types = target_types
-
-class RiskSystem:
-    """风险管理系统"""
-    def __init__(self):
-        self.projects = {}
-        self.rules = self._init_rules()
-
-    def _init_rules(self) -> List[RiskRule]:
-        return [
-            RiskRule(
-                name="sensitive_file",
-                condition=lambda e: "passwd" in e.name.lower(),
-                description="包含敏感信息的文件",
-                level=RiskLevel.CRITICAL,
-                target_types=[EntityType.FILE_PATH]
-            ),
-            RiskRule(
-                name="unsafe_delete_api",
-                condition=lambda e: e.metadata.get("method") == "DELETE",
-                description="不安全的DELETE方法",
-                level=RiskLevel.HIGH,
-                target_types=[EntityType.REST_API]
+    def upsert_project(self, project_id: str, name: str):
+        """插入或更新项目"""
+        with self.conn:
+            self.conn.execute(
+                'INSERT OR REPLACE INTO projects VALUES (?, ?)',
+                (project_id, name)
             )
-        ]
 
-    def register_project(self, project: Project) -> None:
-        self.projects[project.project_id] = project
+    # 实体操作
+    def insert_entity(self, entity_id: str, name: str, entity_type: int, 
+                     metadata: str, project_id: str):
+        """插入新实体"""
+        with self.conn:
+            self.conn.execute(
+                '''INSERT INTO entities 
+                (entity_id, name, type, metadata, project_id)
+                VALUES (?, ?, ?, ?, ?)''',
+                (entity_id, name, entity_type, metadata, project_id)
+            )
 
-    def evaluate_entity(self, entity: Entity) -> EntityRisk:
-        risk = EntityRisk(entity)
-        for rule in self.rules:
-            if entity.type in rule.target_types and rule.condition(entity):
-                risk.add_auto_risk(
-                    rule.name,
-                    rule.level,
-                    {
-                        "description": rule.description,
-                        "evidence": self._collect_evidence(entity)
-                    }
-                )
-        return risk
+    def get_entity(self, entity_id: str) -> Optional[dict]:
+        """获取单个实体"""
+        cursor = self.conn.execute(
+            'SELECT * FROM entities WHERE entity_id = ?', 
+            (entity_id,)
+        )
+        return dict(cursor.fetchone()) if cursor.rowcount else None
 
-    def _collect_evidence(self, entity: Entity) -> dict:
-        evidence = {"entity": entity.name}
-        if entity.type == EntityType.FILE_PATH:
-            evidence["permission"] = entity.metadata.get("permission", "unknown")
-        elif entity.type == EntityType.REST_API:
-            evidence["method"] = entity.metadata.get("method", "GET")
-        return evidence
+    def find_entities(self, project_id: str, name: str = None, 
+                     entity_type: int = None) -> List[dict]:
+        """查找实体"""
+        query = 'SELECT * FROM entities WHERE project_id = ?'
+        params = [project_id]
+        
+        if name:
+            query += ' AND name = ?'
+            params.append(name)
+        if entity_type is not None:
+            query += ' AND type = ?'
+            params.append(entity_type)
+            
+        cursor = self.conn.execute(query, params)
+        return [dict(row) for row in cursor]
 
-    def evaluate_project(self, project_id: str) -> None:
-        project = self.projects.get(project_id)
-        if not project:
+    def update_entity(self, entity_id: str, **kwargs):
+        """
+        更新实体信息
+        :param entity_id: 要修改的实体ID
+        :param kwargs: 可更新字段(name, type, metadata)
+        """
+        if not kwargs:
             return
 
-        for entity in project.entities.values():
-            risk = self.evaluate_entity(entity)
-            project.update_risk(entity.entity_id, risk)
+        valid_fields = {'name', 'type', 'metadata'}
+        updates = {k: v for k, v in kwargs.items() if k in valid_fields}
+        if not updates:
+            raise ValueError("没有有效的更新字段")
 
-    def add_manual_risk(
+        set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+        values = list(updates.values())
+        values.append(entity_id)
+
+        with self.conn:
+            self.conn.execute(
+                f"UPDATE entities SET {set_clause} WHERE entity_id = ?",
+                values
+            )
+
+    def delete_entity(self, entity_id: str):
+        """删除实体及其所有关联风险"""
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM entities WHERE entity_id = ?",
+                (entity_id,)
+            )        
+
+    # 风险操作
+    def insert_auto_risk(self, entity_id: str, rule_name: str, 
+                        level: int, details: str):
+        """插入自动检测风险"""
+        with self.conn:
+            self.conn.execute(
+                '''INSERT INTO auto_risks 
+                (entity_id, rule_name, level, details)
+                VALUES (?, ?, ?, ?)''',
+                (entity_id, rule_name, level, details)
+            )
+
+    def insert_manual_risk(self, entity_id: str, description: str,
+                          level: int, evidence: str):
+        """插入人工标记风险"""
+        with self.conn:
+            self.conn.execute(
+                '''INSERT INTO manual_risks 
+                (entity_id, description, level, evidence)
+                VALUES (?, ?, ?, ?)''',
+                (entity_id, description, level, evidence)
+            )
+
+    def get_entity_risks(self, entity_id: str) -> dict:
+        """获取实体的所有风险"""
+        risks = {'auto': [], 'manual': []}
+        
+        # 自动风险
+        cursor = self.conn.execute(
+            'SELECT * FROM auto_risks WHERE entity_id = ?',
+            (entity_id,)
+        )
+        for row in cursor:
+            risk = dict(row)
+            risk['details'] = json.loads(risk['details'])
+            risks['auto'].append(risk)
+        
+        # 人工风险
+        cursor = self.conn.execute(
+            'SELECT * FROM manual_risks WHERE entity_id = ?',
+            (entity_id,)
+        )
+        for row in cursor:
+            risks['manual'].append(dict(row))
+            
+        return risks
+
+    def get_max_risk_level(self, project_id: str) -> int:
+        """获取项目最大风险等级"""
+        query = '''
+            SELECT MAX(level) as max_level FROM (
+                SELECT level FROM auto_risks
+                WHERE entity_id IN (
+                    SELECT entity_id FROM entities 
+                    WHERE project_id = ?
+                )
+                UNION ALL
+                SELECT level FROM manual_risks
+                WHERE entity_id IN (
+                    SELECT entity_id FROM entities 
+                    WHERE project_id = ?
+                )
+            )
+        '''
+        cursor = self.conn.execute(query, (project_id, project_id))
+        result = cursor.fetchone()
+        return result['max_level'] if result['max_level'] is not None else 0
+
+    def close(self):
+        """关闭数据库连接"""
+        self.conn.close()
+
+class RiskSystem:
+    """纯数据库驱动的风险管理系统"""
+    def __init__(self, db_path='risk_system.db'):
+        self.db = DatabaseManager(db_path)
+        self.rules = self._init_rules()
+
+    def _init_rules(self) -> list:
+        return [
+            {
+                'name': 'sensitive_file',
+                'condition': lambda e: "passwd" in e['name'].lower(),
+                'description': "包含敏感信息的文件",
+                'level': RiskLevel.CRITICAL,
+                'target_types': [EntityType.FILE_PATH]
+            },
+            {
+                'name': 'unsafe_delete_api',
+                'condition': lambda e: json.loads(e['metadata']).get("method") == "DELETE",
+                'description': "不安全的DELETE方法",
+                'level': RiskLevel.HIGH,
+                'target_types': [EntityType.REST_API]
+            }
+        ]
+
+    def register_project(self, project_id: str, name: str):
+        """注册项目"""
+        self.db.upsert_project(project_id, name)
+
+    def evaluate_entity(self, entity_id: str):
+        """评估单个实体风险"""
+        entity = self.db.get_entity(entity_id)
+        if not entity:
+            raise ValueError("实体不存在")
+
+        entity_type = EntityType(entity['type'])
+        metadata = json.loads(entity['metadata'])
+        
+        # 清空旧风险
+        self._clear_auto_risks(entity_id)
+        
+        # 应用规则
+        for rule in self.rules:
+            if entity_type not in rule['target_types']:
+                continue
+                
+            if rule['condition'](entity):
+                risk_details = {
+                    'description': rule['description'],
+                    'evidence': self._collect_evidence(entity, metadata)
+                }
+                self.db.insert_auto_risk(
+                    entity_id=entity_id,
+                    rule_name=rule['name'],
+                    level=rule['level'].value,
+                    details=json.dumps(risk_details)
+                )
+
+    def _clear_auto_risks(self, entity_id: str):
+        """清除自动风险记录"""
+        with self.db.conn:
+            self.db.conn.execute(
+                'DELETE FROM auto_risks WHERE entity_id = ?',
+                (entity_id,)
+            )
+
+    def _collect_evidence(self, entity: dict, metadata: dict) -> dict:
+        """收集证据信息"""
+        evidence = {'entity': entity['name']}
+        entity_type = EntityType(entity['type'])
+        
+        if entity_type == EntityType.FILE_PATH:
+            evidence['permission'] = metadata.get('permission', 'unknown')
+        elif entity_type == EntityType.REST_API:
+            evidence['method'] = metadata.get('method', 'GET')
+            
+        return evidence
+
+    def add_manual_risk(self, entity_id: str, description: str,
+                       level: Union[int, RiskLevel], evidence: str):
+        """添加人工风险"""
+        if isinstance(level, RiskLevel):
+            level = level.value
+        self.db.insert_manual_risk(
+            entity_id=entity_id,
+            description=description,
+            level=level,
+            evidence=evidence
+        )
+
+    def create_entity(self, project_id: str, name: str, 
+                     entity_type: Union[str, EntityType], 
+                     metadata: dict = None) -> str:
+        """创建新实体"""
+        if not self.db.project_exists(project_id):
+            raise ValueError("项目不存在")
+            
+        if isinstance(entity_type, str):
+            entity_type = EntityType[entity_type.upper()]
+            
+        entity_id = str(uuid.uuid4())
+        self.db.insert_entity(
+            entity_id=entity_id,
+            name=name,
+            entity_type=entity_type.value,
+            metadata=json.dumps(metadata or {}),
+            project_id=project_id
+        )
+        return entity_id
+
+    def update_entity(
+            self,
+            entity_id: str,
+            new_name: Optional[str] = None,
+            new_type: Optional[Union[str, EntityType]] = None,
+            new_metadata: Optional[dict] = None
+        ) -> dict:
+            """
+            更新实体信息
+            返回: {"success": bool, "message": str}
+            """
+            result = {"success": False, "message": ""}
+            updates = {}
+
+            try:
+                # 验证实体存在
+                if not self.db.get_entity(entity_id):
+                    raise ValueError("实体不存在")
+
+                # 处理名称更新
+                if new_name is not None:
+                    if not new_name.strip():
+                        raise ValueError("实体名称不能为空")
+                    updates["name"] = new_name
+
+                # 处理类型更新
+                if new_type is not None:
+                    if isinstance(new_type, str):
+                        if not EntityType.is_valid_type(new_type):
+                            raise ValueError(f"无效实体类型: {new_type}")
+                        new_type = EntityType[new_type.upper()]
+                    updates["type"] = new_type.value
+
+                # 处理元数据更新
+                if new_metadata is not None:
+                    try:
+                        updates["metadata"] = json.dumps(new_metadata)
+                    except TypeError:
+                        raise ValueError("无效的元数据格式")
+
+                if updates:
+                    self.db.update_entity(entity_id, **updates)
+                    # 如果修改了类型或元数据，需要重新评估风险
+                    if "type" in updates or "metadata" in updates:
+                        self.evaluate_entity(entity_id)
+
+                    result["success"] = True
+                    result["message"] = "实体更新成功"
+                else:
+                    result["message"] = "没有需要更新的内容"
+
+            except Exception as e:
+                result["message"] = str(e)
+                logger.error(f"更新实体失败: {e}", exc_info=True)
+
+            return result
+
+    def delete_entity(self, entity_id: str) -> dict:
+        """
+        删除实体及其所有风险记录
+        返回: {"success": bool, "message": str}
+        """
+        result = {"success": False, "message": ""}
+        try:
+            if not self.db.get_entity(entity_id):
+                raise ValueError("实体不存在")
+
+            self.db.delete_entity(entity_id)
+            result["success"] = True
+            result["message"] = "实体删除成功"
+        except Exception as e:
+            result["message"] = str(e)
+            logger.error(f"删除实体失败: {e}", exc_info=True)
+        return result   
+
+    def batch_update_risks(
         self,
-        project_id: str,
-        entity_id: str,
-        description: str,
-        level: RiskLevel,
-        evidence: str
-    ) -> None:
-        project = self.projects.get(project_id)
-        if project and entity_id in project.risks:
-            project.risks[entity_id].add_manual_risk(description, level, evidence)
+        conditions: dict,
+        operation: str,
+        operation_params: dict = None
+    ) -> dict:
+        """
+        批量修改实体风险
+        :param conditions: 筛选条件 {
+            'project_id': str,           # 必填，项目ID
+            'entity_type': str/int,      # 可选，实体类型
+            'risk_type': 'auto/manual/all',  # 风险类型，默认all
+            'min_level': int,            # 最低风险等级
+            'max_level': int,            # 最高风险等级
+            'rule_names': list,          # 规则名称列表（仅自动风险）
+            'description_keywords': list # 描述关键词（仅手动风险）
+        }
+        :param operation: 操作类型 ['delete', 'update_level', 'add_manual']
+        :param operation_params: 操作参数（根据操作类型不同）
+        :return: {'success': bool, 'affected_rows': int, 'errors': list}
+        """
+        result = {'success': False, 'affected_rows': 0, 'errors': []}
+        valid_operations = ['delete', 'update_level', 'add_manual']
+        
+        try:
+            # 参数验证
+            if not conditions.get('project_id'):
+                raise ValueError("必须指定项目ID")
+                
+            if operation not in valid_operations:
+                raise ValueError(f"无效操作类型，可选: {valid_operations}")
 
-    def add_manual_risk_by_name_type(
-            self,
-            project_id: str,
-            entity_name: str,
-            entity_type: Union[str, EntityType],
-            description: str,
-            level: Union[int, RiskLevel],
-            evidence: str
-        ) -> dict:
-            """
-            通过实体名称和类型添加手动风险
-            返回: {success: 成功数量, failed: 失败原因列表}
-            """
-            project = self.projects.get(project_id)
-            result = {"success": 0, "failed": []}
+            # 获取符合条件的实体ID列表
+            entity_ids = self._find_entities_by_conditions(conditions)
+            if not entity_ids:
+                return {**result, 'success': True, 'message': "没有符合条件的实体"}
+
+            # 执行批量操作
+            with self.db.conn:
+                if operation == 'delete':
+                    affected = self._batch_delete_risks(
+                        entity_ids, conditions, operation_params
+                    )
+                elif operation == 'update_level':
+                    affected = self._batch_update_risk_level(
+                        entity_ids, conditions, operation_params
+                    )
+                elif operation == 'add_manual':
+                    affected = self._batch_add_manual_risks(
+                        entity_ids, operation_params
+                    )
+
+                result.update({
+                    'success': True,
+                    'affected_rows': affected,
+                    'message': f"成功操作 {affected} 条风险记录"
+                })
+
+        except Exception as e:
+            result['errors'].append(str(e))
+            logger.error(f"批量操作失败: {e}", exc_info=True)
             
-            # 校验项目存在性
-            if not project:
-                result["failed"].append("项目不存在")
-                return result
+        return result
 
-            # 类型安全转换
-            try:
-                if isinstance(entity_type, str):
-                    entity_type = EntityType[entity_type.upper()]
-                if isinstance(level, int):
-                    level = RiskLevel.from_value(level)
-            except KeyError:
-                result["failed"].append(f"无效实体类型: {entity_type}")
-                return result
-            except ValueError:
-                result["failed"].append(f"无效风险等级: {level}")
-                return result
-
-            # 查找匹配实体
-            matched_entities = project.find_entities_by_name_type(entity_name, entity_type)
-            if not matched_entities:
-                result["failed"].append(f"未找到实体: {entity_name}({entity_type.name})")
-                return result
-
-            # 批量添加风险
-            for entity in matched_entities:
-                try:
-                    self.add_manual_risk(
-                        project_id=project_id,
-                        entity_id=entity.entity_id,
-                        description=description,
-                        level=level,
-                        evidence=evidence
-                    )
-                    result["success"] += 1
-                except Exception as e:
-                    result["failed"].append(f"实体 {entity.entity_id} 添加失败: {str(e)}")
-                    logger.error(f"添加风险失败: {e}", exc_info=True)
-
-            return result
-
-    def import_entities_from_json(
-            self,
-            project_id: str,
-            json_path: Union[str, Path],
-            overwrite: bool = False
-        ) -> dict:
-            """
-            从JSON文件批量导入实体到指定项目
-            :param project_id: 目标项目ID
-            :param json_path: JSON文件路径
-            :param overwrite: 是否覆盖已有同名实体
-            :return: 导入结果 {added: 新增数量, skipped: 跳过数量, errors: 错误列表}
-            """
-            project = self.projects.get(project_id)
-            if not project:
-                raise ValueError(f"项目 {project_id} 不存在")
-
-            if isinstance(json_path, str):
-                json_path = Path(json_path)
-
-            result = {"added": 0, "skipped": 0, "errors": []}
+    def _find_entities_by_conditions(self, conditions: dict) -> List[str]:
+        """根据条件查找实体ID列表"""
+        query = '''
+            SELECT entity_id FROM entities 
+            WHERE project_id = ?
+        '''
+        params = [conditions['project_id']]
+        
+        # 实体类型筛选
+        if conditions.get('entity_type'):
+            entity_type = conditions['entity_type']
+            if isinstance(entity_type, str):
+                entity_type = EntityType[entity_type.upper()].value
+            query += " AND type = ?"
+            params.append(entity_type)
             
+        # 执行查询
+        cursor = self.db.conn.execute(query, params)
+        return [row['entity_id'] for row in cursor]
+
+    def _batch_delete_risks(
+        self,
+        entity_ids: List[str],
+        conditions: dict,
+        params: dict
+    ) -> int:
+        """批量删除风险"""
+        risk_type = conditions.get('risk_type', 'all')
+        clauses = []
+        query_params = []
+
+        # 风险等级筛选
+        if conditions.get('min_level'):
+            clauses.append("level >= ?")
+            query_params.append(conditions['min_level'])
+        if conditions.get('max_level'):
+            clauses.append("level <= ?")
+            query_params.append(conditions['max_level'])
+
+        # 构建删除语句
+        total_affected = 0
+        queries = []
+        
+        if risk_type in ['auto', 'all']:
+            auto_where = []
+            auto_params = query_params.copy()
+            
+            # 规则名称筛选
+            if conditions.get('rule_names'):
+                placeholders = ','.join(['?']*len(conditions['rule_names']))
+                auto_where.append(f"rule_name IN ({placeholders})")
+                auto_params.extend(conditions['rule_names'])
+                
+            queries.append((
+                'auto_risks',
+                auto_where,
+                auto_params
+            ))
+
+        if risk_type in ['manual', 'all']:
+            manual_where = []
+            manual_params = query_params.copy()
+            
+            # 描述关键词筛选
+            if conditions.get('description_keywords'):
+                kw_conditions = []
+                for kw in conditions['description_keywords']:
+                    kw_conditions.append("description LIKE ?")
+                    manual_params.append(f"%{kw}%")
+                manual_where.append("(" + " OR ".join(kw_conditions) + ")")
+                
+            queries.append((
+                'manual_risks',
+                manual_where,
+                manual_params
+            ))
+
+        # 执行删除操作
+        for table, where_clauses, params in queries:
+            where = " AND ".join(where_clauses + clauses)
+            if where:
+                where = "WHERE " + where
+            
+            query = f'''
+                DELETE FROM {table}
+                WHERE entity_id IN ({','.join(['?']*len(entity_ids))})
+                {where}
+            '''
+            final_params = entity_ids.copy()
+            final_params.extend(params)
+            
+            cursor = self.db.conn.execute(query, final_params)
+            total_affected += cursor.rowcount
+
+        return total_affected
+
+    def _batch_update_risk_level(
+        self,
+        entity_ids: List[str],
+        conditions: dict,
+        params: dict
+    ) -> int:
+        """批量更新风险等级"""
+        if not params or 'new_level' not in params:
+            raise ValueError("缺少new_level参数")
+            
+        new_level = params['new_level']
+        if isinstance(new_level, RiskLevel):
+            new_level = new_level.value
+        elif not isinstance(new_level, int):
+            raise ValueError("风险等级必须是整数或RiskLevel枚举")
+
+        risk_type = conditions.get('risk_type', 'all')
+        total_affected = 0
+
+        # 更新自动风险
+        if risk_type in ['auto', 'all']:
+            query = '''
+                UPDATE auto_risks 
+                SET level = ?
+                WHERE entity_id IN ({})
+                AND level BETWEEN ? AND ?
+            '''.format(','.join(['?']*len(entity_ids)))
+            
+            params = [
+                new_level,
+                conditions.get('min_level', 0),
+                conditions.get('max_level', 4)
+            ]
+            if conditions.get('rule_names'):
+                query += " AND rule_name IN ({})".format(
+                    ','.join(['?']*len(conditions['rule_names']))
+                )
+                params.extend(conditions['rule_names'])
+            
+            cursor = self.db.conn.execute(query, entity_ids + params)
+            total_affected += cursor.rowcount
+
+        # 更新手动风险
+        if risk_type in ['manual', 'all']:
+            query = '''
+                UPDATE manual_risks 
+                SET level = ?
+                WHERE entity_id IN ({})
+                AND level BETWEEN ? AND ?
+            '''.format(','.join(['?']*len(entity_ids)))
+            
+            params = [
+                new_level,
+                conditions.get('min_level', 0),
+                conditions.get('max_level', 4)
+            ]
+            if conditions.get('description_keywords'):
+                kw_conditions = []
+                for kw in conditions['description_keywords']:
+                    kw_conditions.append("description LIKE ?")
+                    params.append(f"%{kw}%")
+                query += " AND (" + " OR ".join(kw_conditions) + ")"
+            
+            cursor = self.db.conn.execute(query, entity_ids + params)
+            total_affected += cursor.rowcount
+
+        return total_affected
+
+    def _batch_add_manual_risks(
+        self,
+        entity_ids: List[str],
+        params: dict
+    ) -> int:
+        """批量添加手动风险"""
+        required_fields = ['description', 'level', 'evidence']
+        if not all(field in params for field in required_fields):
+            raise ValueError("缺少必要参数: description, level, evidence")
+            
+        try:
+            level = params['level']
+            if isinstance(level, RiskLevel):
+                level = level.value
+            else:
+                level = int(level)
+        except ValueError:
+            raise ValueError("无效的风险等级")
+
+        data = [
+            (eid, params['description'], level, params['evidence'])
+            for eid in entity_ids
+        ]
+        
+        cursor = self.db.conn.executemany('''
+            INSERT INTO manual_risks 
+            (entity_id, description, level, evidence)
+            VALUES (?, ?, ?, ?)
+        ''', data)
+        
+        return cursor.rowcount        
+
+    def get_risk_report(self, project_id: str) -> dict:
+        """生成风险报告"""
+        if not self.db.project_exists(project_id):
+            raise ValueError("项目不存在")
+            
+        max_level = self.db.get_max_risk_level(project_id)
+        entities = self.db.find_entities(project_id)
+        
+        report = {
+            'project_id': project_id,
+            'max_risk_level': RiskLevel(max_level).name,
+            'entities': []
+        }
+        
+        for entity in entities:
+            risks = self.db.get_entity_risks(entity['entity_id'])
+            entity_report = {
+                'entity_id': entity['entity_id'],
+                'name': entity['name'],
+                'type': EntityType(entity['type']).name,
+                'total_risks': len(risks['auto']) + len(risks['manual']),
+                'auto_risks': [{
+                    'rule': r['rule_name'],
+                    'level': RiskLevel(r['level']).name,
+                    'details': r['details']
+                } for r in risks['auto']],
+                'manual_risks': [{
+                    'description': r['description'],
+                    'level': RiskLevel(r['level']).name,
+                    'evidence': r['evidence']
+                } for r in risks['manual']]
+            }
+            report['entities'].append(entity_report)
+            
+        return report
+
+    def import_entities(self, project_id: str, file_path: Union[str, Path]):
+        """从JSON文件导入实体"""
+        file_path = Path(file_path)
+        with file_path.open(encoding='utf-8') as f:
+            entities = json.load(f)
+            
+        for item in entities:
             try:
-                with json_path.open('r', encoding='utf-8') as f:
-                    entities_data = json.load(f)
-            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                result["errors"].append(f"JSON解析失败: {str(e)}")
-                return result
-            except FileNotFoundError:
-                result["errors"].append(f"文件不存在: {json_path}")
-                return result
+                self.create_entity(
+                    project_id=project_id,
+                    name=item['name'],
+                    entity_type=item['type'],
+                    metadata=item.get('metadata')
+                )
+            except Exception as e:
+                logger.error(f"导入失败: {str(e)}")
 
-            for idx, data in enumerate(entities_data, 1):
-                try:
-                    # 类型转换校验
-                    entity_type = EntityType[data["type"].upper()]
-                    
-                    # 名称查重逻辑
-                    existing = next(
-                        (e for e in project.entities.values() 
-                        if e.name == data["name"] and e.type == entity_type),
-                        None
-                    )
-                    
-                    if existing and not overwrite:
-                        result["skipped"] += 1
-                        logger.info(f"跳过重复实体: {data['name']}")
-                        continue
-                        
-                    # 创建新实体
-                    entity = Entity(
-                        name=data["name"],
-                        entity_type=entity_type,
-                        metadata=data.get("metadata", {})
-                    )
-                    project.add_entity(entity)
-                    result["added"] += 1
-
-                    # 自动评估风险
-                    risk = self.evaluate_entity(entity)
-                    project.update_risk(entity.entity_id, risk)
-
-                except KeyError as e:
-                    error_msg = f"条目{idx}: 缺少必要字段 {str(e)}"
-                    result["errors"].append(error_msg)
-                    logger.warning(error_msg)
-                except Exception as e:
-                    error_msg = f"条目{idx}: 处理失败 - {str(e)}"
-                    result["errors"].append(error_msg)
-                    logger.error(error_msg, exc_info=True)
-
-            logger.info(f"导入完成: 新增 {result['added']} 实体，跳过 {result['skipped']} 项")
-            return result
-
-# 测试用例
+# 使用示例
 if __name__ == "__main__":
     # 初始化系统
-    system = RiskSystem()
-
-    # 创建项目
-    project = Project("P1", "核心系统")
+    system = RiskSystem("test.db")
+    
+    # 注册项目
+    system.register_project("P1", "核心系统")
     
     # 创建实体
-    file_entity = Entity(
+    entity_id = system.create_entity(
+        project_id="P1",
         name="/etc/passwd",
-        entity_type=EntityType.FILE_PATH,
+        entity_type="FILE_PATH",
         metadata={"permission": 644}
     )
     
-    api_entity = Entity(
-        name="/api/users",
-        entity_type=EntityType.REST_API,
-        metadata={"method": "DELETE"}
-    )
+    # 评估风险
+    system.evaluate_entity(entity_id)
 
-    # 添加实体到项目
-    project.add_entity(file_entity)
-    project.add_entity(api_entity)
+    # 创建测试实体
+    entity_id = system.create_entity(
+        project_id="P1",
+        name="old_name.txt",
+        entity_type="FILE_PATH",
+        metadata={"version": 1}
+    )
     
-    # 注册项目并评估
-    system.register_project(project)
-    system.evaluate_project("P1")
-
-    # 导入实体
-    result = system.import_entities_from_json(
-        project_id="P1",
-        json_path="entities.json",
-        overwrite=True
+    # 修改实体信息
+    update_result = system.update_entity(
+        entity_id=entity_id,
+        new_name="new_name2.txt",
+        new_metadata={"version": 2, "permission": 644}
     )
+    print("更新结果:", update_result)
+    
+    # 验证修改
+    entity = system.db.get_entity(entity_id)
+    print("修改后的实体:", entity)
 
-    # 添加手动风险
+    # 添加人工风险
     system.add_manual_risk(
-        project_id="P1",
-        entity_id=file_entity.entity_id,
-        description="人工标记的配置风险",
+        entity_id=entity_id,
+        description="人工标记风险",
         level=RiskLevel.HIGH,
-        evidence="安全审计报告第5章"
+        evidence="安全审计报告"
     )
 
-    # 通过名称类型添加风险
-    result = system.add_manual_risk_by_name_type(
+           # 导入实体
+    result = system.import_entities(
         project_id="P1",
-        entity_name="/api/admin2",
-        entity_type="REST_API",  # 支持字符串或枚举
-        description="接口无认证",
-        level=RiskLevel.HIGH,     # 支持枚举或整数值
-        evidence="CIS标准第3.1章"
+        file_path="entities.json"
     )
+    print(result)
 
-    print(f"操作结果: {result}")
-
-    result = system.add_manual_risk_by_name_type(
-        project_id="P1",
-        entity_name="/api/admin2",
-        entity_type="REST_API",  # 支持字符串或枚举
-        description="接口无认证xx",
-        level=RiskLevel.HIGH,     # 支持枚举或整数值
-        evidence="CIS标准第3.1章"
+    #将所有中高风险升级为低风险
+    
+    result = system.batch_update_risks(
+        conditions={
+            'project_id': 'P1',
+            'min_level': RiskLevel.MEDIUM.value,
+            'max_level': RiskLevel.HIGH.value
+        },
+        operation='update_level',
+        operation_params={'new_level': RiskLevel.LOW}
     )
-
+    print("更新结果:", result)
+    
     # 生成报告
-    report = project.get_full_report()
-
-    # 打印详细报告
-    def print_detailed_report(report: dict):
-        """格式化打印报告"""
-        print(f"\n{' 项目风险评估报告 ':=^60}")
-        print(f"项目名称: {report['project_info']['name']}")
-        print(f"整体风险等级: {report['project_info']['overall_risk']}")
-        
-        print("\n实体详细风险分析:")
-        for entity in report['entities']:
-            print(f"\n■ 实体名称: {entity['name']}")
-            print(f"  类型: {entity['type']}")
-            print(f"  风险等级: {entity['risk_level']}")
-            print(f"  总风险项: {entity['total_risks']}")
-            
-            print("\n  自动检测风险:")
-            for risk in entity['auto_risks']:
-                print(f"  - [规则] {risk['rule']}")
-                print(f"    等级: {risk['level'].name}")
-                print(f"    描述: {risk['details']['description']}")
-                print(f"    证据: {risk['details']['evidence']}")
-            
-            print("\n  人工标记风险:")
-            for risk in entity['manual_risks']:
-                print(f"  - {risk['description']}")
-                print(f"    等级: {risk['level'].name}")
-                print(f"    依据: {risk['evidence']}")
-
-    print_detailed_report(report)
+    #report = system.get_risk_report("P1")
+    #print(json.dumps(report, indent=2, ensure_ascii=False))
+    
+    # 关闭连接
+    system.db.close()
