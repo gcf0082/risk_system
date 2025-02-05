@@ -738,6 +738,256 @@ class RiskSystem:
             except Exception as e:
                 logger.error(f"导入失败: {str(e)}")
 
+def export_to_json(self, file_path: Union[str, Path], 
+                      export_projects: bool = True) -> None:
+        """
+        导出系统数据到JSON文件
+        :param file_path: 导出文件路径
+        :param export_projects: 是否导出项目信息
+        """
+        data = {"version": "1.0"}
+        
+        # 导出项目信息
+        if export_projects:
+            data["projects"] = self._export_projects()
+        
+        # 导出实体及风险信息
+        data["entities"] = self._export_entities(export_projects)
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _export_projects(self) -> List[Dict]:
+        """导出所有项目"""
+        cursor = self.db.conn.execute("SELECT * FROM projects")
+        return [dict(row) for row in cursor]
+
+    def _export_entities(self, include_project: bool) -> List[Dict]:
+        """导出所有实体及其风险"""
+        entities = []
+        cursor = self.db.conn.execute("SELECT * FROM entities")
+        for entity_row in cursor:
+            entity = dict(entity_row)
+            entity_id = entity["entity_id"]
+            
+            # 处理项目关联
+            if not include_project:
+                entity.pop("project_id", None)
+            
+            # 获取风险数据
+            risks = {"auto": [], "manual": []}
+            
+            # 自动风险
+            auto_cursor = self.db.conn.execute(
+                "SELECT rule_name, level, details FROM auto_risks WHERE entity_id = ?",
+                (entity_id,)
+            )
+            for risk_row in auto_cursor:
+                risk = dict(risk_row)
+                risk["rule"] = risk.pop("rule_name")
+                risk["details"] = json.loads(risk["details"])
+                risk["level"] = RiskLevel(risk["level"]).name
+                risks["auto"].append(risk)
+            
+            # 手动风险
+            manual_cursor = self.db.conn.execute(
+                "SELECT description, level, evidence FROM manual_risks WHERE entity_id = ?",
+                (entity_id,)
+            )
+            for risk_row in manual_cursor:
+                risk = dict(risk_row)
+                risk["level"] = RiskLevel(risk["level"]).name
+                risks["manual"].append(risk)
+            
+            if risks["auto"] or risks["manual"]:
+                entity["risks"] = risks
+            
+            # 转换类型枚举
+            entity["type"] = EntityType(entity["type"]).name
+            entities.append(entity)
+        
+        return entities
+
+    def import_from_json(self, file_path: Union[str, Path], 
+                        conflict_policy: str = "skip") -> Dict:
+        """
+        从JSON文件导入数据
+        :param file_path: 导入文件路径
+        :param conflict_policy: 冲突处理策略 (skip/overwrite)
+        :return: 导入结果统计
+        """
+        result = {
+            "projects": {"added": 0, "skipped": 0},
+            "entities": {"added": 0, "updated": 0, "skipped": 0},
+            "risks": {"auto": 0, "manual": 0}
+        }
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            with self.db.conn:  # 事务处理
+                # 处理项目导入
+                if "projects" in data:
+                    for project in data["projects"]:
+                        res = self._import_project(project, conflict_policy)
+                        result["projects"]["added"] += res["added"]
+                        result["projects"]["skipped"] += res["skipped"]
+                
+                # 处理实体导入
+                for entity in data["entities"]:
+                    res = self._import_entity(entity, conflict_policy)
+                    result["entities"]["added"] += res["added"]
+                    result["entities"]["updated"] += res["updated"]
+                    result["entities"]["skipped"] += res["skipped"]
+                    result["risks"]["auto"] += res["risks"]["auto"]
+                    result["risks"]["manual"] += res["risks"]["manual"]
+            
+            return result
+        except Exception as e:
+            self.db.conn.rollback()
+            return {"error": str(e)}
+
+    def _import_project(self, project: Dict, policy: str) -> Dict:
+        """导入单个项目"""
+        res = {"added": 0, "skipped": 0}
+        project_id = project["project_id"]
+        
+        # 检查项目是否存在
+        cursor = self.db.conn.execute(
+            "SELECT 1 FROM projects WHERE project_id = ?",
+            (project_id,)
+        )
+        exists = cursor.fetchone() is not None
+        
+        if exists:
+            if policy == "overwrite":
+                self.db.conn.execute(
+                    "UPDATE projects SET name = ? WHERE project_id = ?",
+                    (project["name"], project_id)
+                )
+            else:
+                res["skipped"] += 1
+                return res
+        else:
+            self.db.conn.execute(
+                "INSERT INTO projects (project_id, name) VALUES (?, ?)",
+                (project_id, project["name"])
+            )
+            res["added"] += 1
+        
+        return res
+
+    def _import_entity(self, entity: Dict, policy: str) -> Dict:
+        """导入单个实体及风险"""
+        res = {
+            "added": 0, "updated": 0, "skipped": 0,
+            "risks": {"auto": 0, "manual": 0}
+        }
+        
+        # 转换实体类型
+        try:
+            entity_type = EntityType[entity["type"].upper()].value
+        except KeyError:
+            return {**res, "skipped": 1}
+        
+        # 处理项目关联
+        project_id = entity.get("project_id")
+        if project_id:
+            # 验证项目是否存在
+            cursor = self.db.conn.execute(
+                "SELECT 1 FROM projects WHERE project_id = ?",
+                (project_id,)
+            )
+            if not cursor.fetchone():
+                project_id = None  # 解除无效项目关联
+        
+        # 检查实体是否存在
+        entity_id = entity.get("entity_id") or str(uuid.uuid4())
+        cursor = self.db.conn.execute(
+            "SELECT 1 FROM entities WHERE entity_id = ?",
+            (entity_id,)
+        )
+        exists = cursor.fetchone() is not None
+        
+        # 处理元数据
+        metadata = json.dumps(entity.get("metadata", {}))
+        
+        if exists:
+            if policy == "overwrite":
+                self.db.conn.execute('''
+                    UPDATE entities SET
+                        name = ?,
+                        type = ?,
+                        metadata = ?,
+                        project_id = ?
+                    WHERE entity_id = ?
+                ''', (
+                    entity["name"],
+                    entity_type,
+                    metadata,
+                    project_id,
+                    entity_id
+                ))
+                res["updated"] += 1
+            else:
+                res["skipped"] += 1
+                return res
+        else:
+            self.db.conn.execute('''
+                INSERT INTO entities 
+                (entity_id, name, type, metadata, project_id)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (
+                entity_id,
+                entity["name"],
+                entity_type,
+                metadata,
+                project_id
+            ))
+            res["added"] += 1
+        
+        # 处理风险数据
+        risks = entity.get("risks", {})
+        
+        # 导入自动风险
+        for auto_risk in risks.get("auto", []):
+            try:
+                level = RiskLevel[auto_risk["level"].upper()].value
+                self.db.conn.execute('''
+                    INSERT INTO auto_risks 
+                    (entity_id, rule_name, level, details)
+                    VALUES (?, ?, ?, ?)
+                ''', (
+                    entity_id,
+                    auto_risk["rule"],
+                    level,
+                    json.dumps(auto_risk["details"])
+                ))
+                res["risks"]["auto"] += 1
+            except Exception as e:
+                logger.warning(f"导入自动风险失败: {e}")
+        
+        # 导入手动风险
+        for manual_risk in risks.get("manual", []):
+            try:
+                level = RiskLevel[manual_risk["level"].upper()].value
+                self.db.conn.execute('''
+                    INSERT INTO manual_risks 
+                    (entity_id, description, level, evidence)
+                    VALUES (?, ?, ?, ?)
+                ''', (
+                    entity_id,
+                    manual_risk["description"],
+                    level,
+                    manual_risk["evidence"]
+                ))
+                res["risks"]["manual"] += 1
+            except Exception as e:
+                logger.warning(f"导入手动风险失败: {e}")
+        
+        return res
+
 # 使用示例
 if __name__ == "__main__":
     # 初始化系统
